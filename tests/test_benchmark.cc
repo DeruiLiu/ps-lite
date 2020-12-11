@@ -221,6 +221,7 @@ void RunWorker(int argc, char *argv[]) {
     memcpy(ptr_len, &len, sizeof(len));
     server_lens.push_back(lens);
 
+    //Waits until a push or pull has been finished
     kv.Wait(kv.ZPush(keys, vals, lens));
   }
 
@@ -282,7 +283,7 @@ int main(int argc, char *argv[]) {
   // disable multi-threaded processing first
   setenv("ENABLE_SERVER_MULTIPULL", "0", 1);
   // start system
-  Start(0);
+  Start(0);//0表示comuser id
   // setup server nodes
   StartServer();
   // run worker nodes
