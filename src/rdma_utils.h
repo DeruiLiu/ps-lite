@@ -100,6 +100,7 @@ class MemoryAllocator {
     
     std::lock_guard<std::mutex> lk(mu_);
     mr_[p] = mr;
+    //p表示起始的内存地址，size表示注册的内存大小
     used_list.emplace(p, size);
 
     return p;
@@ -132,7 +133,7 @@ class MemoryAllocator {
   struct ibv_pd *pd_;
   size_t pagesize_ = sysconf(_SC_PAGESIZE);
   std::unordered_map<char *, size_t> used_list;
-  std::unordered_map<char *, struct ibv_mr *> mr_;
+  std::unordered_map<char *, struct ibv_mr *> mr_;//mr_为本地的一个内存管理池
 };
 
 struct WRContext {
