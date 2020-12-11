@@ -1,3 +1,4 @@
+阅读byteps ps-lite源码中加入了一些自己的注释
 This is the communication library for [BytePS](https://github.com/bytedance/byteps). It is designed for high performance RDMA. However, it also supports TCP.
 
 ## Build
