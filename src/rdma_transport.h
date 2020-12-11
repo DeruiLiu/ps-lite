@@ -32,7 +32,7 @@ struct Endpoint {
   std::condition_variable cv;
   std::mutex connect_mu;
   struct rdma_cm_id *cm_id;
-  std::shared_ptr<Transport> trans;
+  std::shared_ptr<Transport> trans;//Transport作为父类，可以通过多态来访问子类
 
   int kStartDepth = 128;
   int kRxDepth = 2048;
@@ -131,9 +131,9 @@ struct Endpoint {
         << "Create RDMA queue pair failed: " << strerror(errno);
 
     InitSendContextHelper(pd, start_ctx, &free_start_ctx, kStartDepth,
-                          kRendezvousStartContext);
+                          kRendezvousStartContext);//发送数据时是一块内存
     InitSendContextHelper(pd, reply_ctx, &free_reply_ctx, kReplyDepth,
-                          kRendezvousReplyContext);
+                          kRendezvousReplyContext);//接收数据是一块内存
 
     for (int i = 0; i < kRxDepth; ++i) {
       void *buf;
@@ -262,6 +262,7 @@ class RDMATransport : public Transport {
         << strerror(errno);
   }
 
+  //将自己的地址发送给对端
   void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &addrpool) {
     BufferContext *buf_ctx = new BufferContext();
     buf_ctx->meta_len = req->meta_len;
@@ -274,7 +275,7 @@ class RDMATransport : public Transport {
     }
     
     // worker only needs a buffer for receving meta
-    char *buffer = allocator_->Alloc(
+    char *buffer = allocator_->Alloc(//分配内存时连这块内存一起注册了，buffer表示注册内存的这块起始地址
         is_server_ ? (align_ceil(req->meta_len, pagesize_) + data_len) : req->meta_len);
     CHECK(buffer);
     buf_ctx->buffer = buffer;
@@ -285,10 +286,10 @@ class RDMATransport : public Transport {
     RendezvousReply *resp =
         reinterpret_cast<RendezvousReply *>(reply_ctx->buffer->addr);
 
-    resp->addr = reinterpret_cast<uint64_t>(buffer);
+    resp->addr = reinterpret_cast<uint64_t>(buffer);//buffer表示注册的内存的起始地址
     resp->rkey = allocator_->RemoteKey(buffer);
     resp->origin_addr = req->origin_addr;
-    resp->idx = addrpool.StoreAddress(buf_ctx);
+    resp->idx = addrpool.StoreAddress(buf_ctx);//buf_ctx即为一个指针
 
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(resp);
