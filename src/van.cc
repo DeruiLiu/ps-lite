@@ -188,10 +188,10 @@ void Van::ProcessAddNodeCommandAtScheduler(Message *msg, Meta *nodes, Meta *reco
                                            : Postoffice::WorkerRankToID(num_workers_);
         PS_VLOG(1) << "assign rank=" << id << " to node " << node.DebugString();
         node.id = id;
-        Connect(node);
+        Connect(node);//加入一个连接
         Postoffice::Get()->UpdateHeartbeat(node.id, t);
         connected_nodes_[node_host_ip] = id;
-      } else {
+      } else {//如果已经建立了连接
         int id = node.role == Node::SERVER ? Postoffice::ServerRankToID(num_servers_)
                                            : Postoffice::WorkerRankToID(num_workers_);
         shared_node_mapping_[id] = connected_nodes_[node_host_ip];
@@ -372,7 +372,7 @@ void Van::ProcessAddNodeCommand(Message *msg, Meta *nodes, Meta *recovery_nodes)
 
   UpdateLocalID(msg, &dead_set, nodes, recovery_nodes);
 
-  if (is_scheduler_) {
+  if (is_scheduler_) {//如果自己是scheduler
     ProcessAddNodeCommandAtScheduler(msg, nodes, recovery_nodes);
   } else {
     for (const auto &node : ctrl.node) {
@@ -389,6 +389,7 @@ void Van::ProcessAddNodeCommand(Message *msg, Meta *nodes, Meta *recovery_nodes)
   }
 }
 
+//父类的虚函数，Van中实现该接口
 void Van::Start(int customer_id, bool standalone) {
   // get scheduler info
   start_mu_.lock();
@@ -401,9 +402,9 @@ void Van::Start(int customer_id, bool standalone) {
 
 
     // get my node info
-    if (is_scheduler_) {
+    if (is_scheduler_) {//如果自己本身是scheduler
       SetNode(scheduler_);
-    } else {
+    } else {//否则
       auto role = Postoffice::Get()->is_worker() ? Node::WORKER : Node::SERVER;
       const char *nhost = Environment::Get()->find("DMLC_NODE_HOST");
       std::string ip;
@@ -436,25 +437,27 @@ void Van::Start(int customer_id, bool standalone) {
       SetNode(node);
     }
 
-    // bind.
+    //bind和Connect在Van中均为纯虚函数，需要要子类重写
+    // bind.即各个节点启用rdma绑定一个端口，//RDMAVan调用的是RDMAVan对应的Bind
+    //即相当于每个节点都在本地启用一个server端
     my_node_.port = Bind(my_node_, is_scheduler_ ? 0 : 40);
     PS_VLOG(1) << "Bind to " << my_node_.DebugString();
     CHECK_NE(my_node_.port, -1) << "bind failed";
 
     // connect to the scheduler
-    Connect(scheduler_);
+    Connect(scheduler_);//RDMAVan调用的是RDMAVan对应的Connect,各个节点去连接scheduler
 
     // for debug use
     if (Environment::Get()->find("PS_DROP_MSG")) {
       drop_rate_ = atoi(Environment::Get()->find("PS_DROP_MSG"));
     }
-    // start receiver
+    // start receiver，各个节点开启一个Recving，用来处理控制信息，如维护心跳，增加节点等
     receiver_thread_ = std::unique_ptr<std::thread>(new std::thread(&Van::Receiving, this));
     init_stage++;
   }
   start_mu_.unlock();
 
-  if (!is_scheduler_) {
+  if (!is_scheduler_) {//即对于worker节点和server节点需要发送
     // let the scheduler know myself
     Message msg;
     Node customer_specific_node = my_node_;
@@ -463,7 +466,7 @@ void Van::Start(int customer_id, bool standalone) {
     msg.meta.control.cmd = Control::ADD_NODE;
     msg.meta.control.node.push_back(customer_specific_node);
     msg.meta.timestamp = timestamp_++;
-    Send(msg);
+    Send(msg);//该Send是在Van中的非虚函数
   }
 
   // wait until ready
@@ -522,7 +525,7 @@ void Van::Stop() {
 }
 
 int Van::Send(Message &msg) {
-  int send_bytes = SendMsg(msg);
+  int send_bytes = SendMsg(msg);//这个时候就调用的是RDMAVan中的SendMsg
   CHECK_NE(send_bytes, -1) << this->GetType() << " sent -1 bytes";
   send_bytes_ += send_bytes;
   if (resender_) resender_->AddOutgoing(msg);
@@ -538,7 +541,7 @@ void Van::Receiving() {
   recovery_nodes.control.cmd = Control::ADD_NODE;
 
   while (true) {
-    Message msg;
+    Message msg;//节点收到了这样一个msg
     int recv_bytes = RecvMsg(&msg);
     // For debug, drop received message
     if (ready_.load() && drop_rate_ > 0) {
@@ -700,7 +703,7 @@ void Van::UnpackMeta(const char *meta_buf, int buf_size, Meta *meta) {
 
 void Van::Heartbeat() {
   const char *val = Environment::Get()->find("PS_HEARTBEAT_INTERVAL");
-  const int interval = val ? atoi(val) : kDefaultHeartbeatInterval;
+  const int interval = val ? atoi(val) : kDefaultHeartbeatInterval;//默认多长时间发送一次心跳
   while (interval > 0 && ready_.load()) {
     std::this_thread::sleep_for(std::chrono::seconds(interval));
     Message msg;
