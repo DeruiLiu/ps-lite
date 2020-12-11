@@ -39,14 +39,15 @@ class RDMAVan : public Van {
     start_mu_.lock();
     should_stop_ = false;
 
-    auto val = Environment::Get()->find("BYTEPS_ENABLE_IPC");
+    auto val = Environment::Get()->find("BYTEPS_ENABLE_IPC");//启用进程间通信，能够加快训练速度
     disable_ipc_ = val ? !atoi(val) : true;
     if (disable_ipc_) LOG(INFO) << "Shared memory IPC has been disabled";
 
     if (event_channel_ == nullptr) {
-      event_channel_ = rdma_create_event_channel();
+      event_channel_ = rdma_create_event_channel();//创建一个用于接收events的通道
       CHECK(event_channel_) << "Create RDMA event channel failed";
 
+      //启用一个本地线程来持续监听收到的events
       cm_event_polling_thread_.reset(
           new std::thread(&RDMAVan::PollEvents, this));
     }
@@ -56,7 +57,7 @@ class RDMAVan : public Van {
     enable_log_ = val ? atoi(val) : false;
     if (enable_log_) LOG(INFO) << "Enable RDMA logging.";
 
-    val = Environment::Get()->find("BYTEPS_RDMA_MAX_CONCURR_WR");
+    val = Environment::Get()->find("BYTEPS_RDMA_MAX_CONCURR_WR");//即环境变量中是否引入了这些参数的设置
     if (val) {    
       // should make sure: kMaxConcurrentWorkRequest >= kStartDepth + kReplyDepth + kRxDepth
       kMaxConcurrentWorkRequest = atoi(val);
@@ -73,7 +74,9 @@ class RDMAVan : public Van {
     }
 
     start_mu_.unlock();
-    if (!standalone) Van::Start(customer_id, false);
+
+    //Postoffice传入的standalone为flase，即会再次调用一次Van::Start()
+    if (!standalone) Van::Start(customer_id, false);//为什么此处又要去调用Van对应的Start？因为需要使得当前节点与Scheduler相连
   }
 
   void Stop() override {
@@ -119,7 +122,7 @@ class RDMAVan : public Van {
   }
 
   int Bind(const Node &node, int max_retry) override {
-    CHECK(rdma_create_id(event_channel_, &listener_, nullptr, RDMA_PS_TCP) == 0)
+    CHECK(rdma_create_id(event_channel_, &listener_, nullptr, RDMA_PS_TCP) == 0)//创建用于跟踪通信信息的标识符，概念上类似于套接字
         << "Create RDMA connection identifier failed";
     
     struct sockaddr_in addr;
@@ -136,7 +139,7 @@ class RDMAVan : public Van {
     unsigned seed = static_cast<unsigned>(time(NULL) + port);
     for (int i = 0; i < max_retry + 1; ++i) {
       addr.sin_port = htons(port);
-      if (rdma_bind_addr(listener_,
+      if (rdma_bind_addr(listener_,//将源地址与rdma_cm_id关联起来
                          reinterpret_cast<struct sockaddr *>(&addr)) == 0) {
         break;
       }
@@ -146,6 +149,7 @@ class RDMAVan : public Van {
         port = 10000 + rand_r(&seed) % 40000;
       }
     }
+    //启动侦听传入的连接请求，监听本地绑定的源地址
     CHECK(rdma_listen(listener_, kRdmaListenBacklog) == 0)
         << "Listen RDMA connection failed: " << strerror(errno);
     return port;
@@ -166,13 +170,13 @@ class RDMAVan : public Van {
       endpoints_mu_.lock();
       auto it = endpoints_.find(node.id);
 
-      // if there is an endpoint with pending connection
+      // if there is an endpoint with pending connection，如果已经有一个连接，则先把该连接删除
       if (it != endpoints_.end()) {
         endpoints_.erase(it);
       }
 
       Endpoint *endpoint;
-      endpoints_[node.id] = std::make_unique<Endpoint>();
+      endpoints_[node.id] = std::make_unique<Endpoint>();//endpoints_表示本地启用的连接对端的rdma连接
       endpoint = endpoints_[node.id].get();
       endpoints_mu_.unlock();
 
@@ -184,6 +188,7 @@ class RDMAVan : public Van {
                       nullptr, &remote_addr),
           0);
 
+      //接下来的一套流程即为CM下RDMA建链的一套流程，对应client端
       while (endpoint->status != Endpoint::CONNECTED) {
         std::unique_lock<std::mutex> lk(endpoint->connect_mu);
         endpoint->status = Endpoint::CONNECTING;
@@ -194,11 +199,12 @@ class RDMAVan : public Van {
           endpoint->cm_id = nullptr;
         }
 
+        //分配一个rdma_cm_id，与socket相似
         CHECK_EQ(rdma_create_id(event_channel_, &endpoint->cm_id, nullptr,
                                 RDMA_PS_TCP),
                  0)
             << "Create RDMA connection identifier failed";
-        endpoint->cm_id->context = endpoint;
+        endpoint->cm_id->context = endpoint;//此处的context应该指buf，需要分配内存空间
 
         auto val = Environment::Get()->find("DMLC_NODE_HOST");
         if (val) {
@@ -209,7 +215,7 @@ class RDMAVan : public Van {
           CHECK_EQ(rdma_resolve_addr(endpoint->cm_id, addr->ai_addr,
                               remote_addr->ai_addr, kTimeoutms), 0)
               << "Resolve RDMA address failed with errno: " << strerror(errno);
-        } else {
+        } else {//获得一个本地设备来连接到远程地址
           CHECK_EQ(rdma_resolve_addr(endpoint->cm_id, nullptr,
                                      remote_addr->ai_addr, kTimeoutms),
                    0)
@@ -233,7 +239,7 @@ class RDMAVan : public Van {
 
       LOG(INFO) << "Connect to Node " << node.id
                 << " with Transport=" << (is_local_node ? "IPC" : "RDMA");
-
+      //mem_allocator_为RDMAVan的内存分配器，make_shared在动态内存中分配一个对象并初始化它，返回指向此对象的shared_ptr
       std::shared_ptr<Transport> t = is_local_node ?
           std::make_shared<IPCTransport>(endpoint, mem_allocator_.get()) :
           std::make_shared<RDMATransport>(endpoint, mem_allocator_.get());
@@ -243,6 +249,7 @@ class RDMAVan : public Van {
     }
   }
 
+  //初始化环境后，最开始先由worker发起一个SendMsg，里面包含相关信息
   int SendMsg(Message &msg) override {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
@@ -252,35 +259,36 @@ class RDMAVan : public Van {
     Endpoint *endpoint = endpoints_[remote_id].get();
     endpoints_mu_.unlock();
 
-    int meta_len = GetPackMetaLen(msg.meta);
-    size_t data_len = msg.meta.data_size;
-    size_t total_len = meta_len + data_len;
+    int meta_len = GetPackMetaLen(msg.meta);//消息元数据长度
+    size_t data_len = msg.meta.data_size;//消息数据体长度，数据是由类似vector组成
+    size_t total_len = meta_len + data_len;//消息总长度
     CHECK(meta_len);
 
-    RegisterMemory(msg);
+    RegisterMemory(msg);//将msg中所含的信息地址内存都注册
 
     // pack meta info
-    if (IsValidPushpull(msg)) {
+    if (IsValidPushpull(msg)) {//若控制信息为空，则将本地地址的rkey加入到meta中
       AddMeta(msg);
     }
 
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
 
     // start rendezvous if no remote info
-    if (!IsValidPushpull(msg)) { 
-      MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);
-      StoreMsgBuf(msg_buf, msg);
-      trans->SendRendezvousBegin(msg, msg_buf);
+    if (!IsValidPushpull(msg)) {//控制信息不为空，
+      MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);//为这块msg注册一块内存用来发送
+      StoreMsgBuf(msg_buf, msg);//将msg_buf和msg的对应关系存储下来
+      trans->SendRendezvousBegin(msg, msg_buf);//将这个请求信息发送，但是发送时并没有携带本端的address和rkey
       return total_len;
 
-    } else {
+    } else {//控制信息为空，则表示传数据？
       auto is_push = msg.meta.push;
       auto key = msg.meta.key;
-      if (!HasRemoteInfo(msg, key, is_push, remote_id)) {
-        MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);
-        StoreMsgBuf(msg_buf, msg);
+      
+      if (!HasRemoteInfo(msg, key, is_push, remote_id)) {//这个时候如果没有远端的地址信息
+        MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);//为这块msg注册一块内存用来发送
+        StoreMsgBuf(msg_buf, msg);//将msg_buf和msg的对应关系存储下来
         PrepareData(msg, msg_buf);
-        trans->SendRendezvousBegin(msg, msg_buf);
+        trans->SendRendezvousBegin(msg, msg_buf);//将这个请求信息发送，但是发送时并没有携带本端的address和rkey
         return total_len;
       } 
     }
@@ -296,10 +304,11 @@ class RDMAVan : public Van {
 
     PrintSendLog(msg, msg_buf, addr_tuple);
 
+    //表示自己要发送的数据类型
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
-      // worker, push request
-      trans->SendPushRequest(msg, msg_buf, addr_tuple);
+      // worker, push request，自己要发送一个push request的请求
+      trans->SendPushRequest(msg, msg_buf, addr_tuple);//将meta和data(keys,vals,lens)分开写
     } else if (msg.meta.push && !msg.meta.request) { 
       // server, push response
       trans->SendPushResponse(msg, msg_buf, addr_tuple);
@@ -323,16 +332,16 @@ class RDMAVan : public Van {
   int RecvMsg(Message *msg) override {
     msg->data.clear();
     std::tuple<Endpoint *, BufferContext *> notification;
-    recv_buffers_.WaitAndPop(&notification);
+    recv_buffers_.WaitAndPop(&notification);//该调用是阻塞的
 
     Endpoint *endpoint = std::get<Endpoint *>(notification);
     BufferContext *buffer_ctx = std::get<BufferContext *>(notification);
 
-    msg->meta.recver = my_node_.id;
-    msg->meta.sender = endpoint->node_id;
+    msg->meta.recver = my_node_.id;//表示接收端为自己
+    msg->meta.sender = endpoint->node_id;//发送端为对端
 
-    // the second argument is actually deprecated,
-    // we keep it as is in order to be compatible    
+    // the second argument is actually deprecated,弃用
+    // we keep it as is in order to be compatible//将从buffer_ctx起始地址开始的一块数据赋值为msg->meta
     UnpackMeta(buffer_ctx->buffer, buffer_ctx->meta_len, &msg->meta); 
     int meta_len = GetPackMetaLen(msg->meta);
 
@@ -505,19 +514,19 @@ class RDMAVan : public Van {
 
   MessageBuffer* PrepareNewMsgBuf(Message& msg) {
     MessageBuffer *msg_buf = new MessageBuffer();
-    auto meta_len = GetPackMetaLen(msg.meta);
+    auto meta_len = GetPackMetaLen(msg.meta);//获取元数据的长度
     msg_buf->inline_len = meta_len;
-    msg_buf->inline_buf = mem_allocator_->Alloc(meta_len);
-    msg_buf->data = msg.data;
-    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
+    msg_buf->inline_buf = mem_allocator_->Alloc(meta_len);//注册meta_len大小的内存
+    msg_buf->data = msg.data;//data包含keys,vals,lens
+    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);//将msg.meta拷贝到msg_buf->inline_buf开始的一段内存
     return msg_buf;
   }
 
   void RegisterMemory(Message &msg) { 
     size_t sa_cnt = 0;
-    for (auto& sa : msg.data) {
+    for (auto& sa : msg.data) {//msg.data是一个vector数组，即不一定是连续的数据块，
       if (sa.size() == 0) continue;
-      std::lock_guard<std::mutex> lock(map_mu_);
+      std::lock_guard<std::mutex> lock(map_mu_);//sa.data()即返回sa保存的指针，data应该分为keys,vals,lens
       if ((mem_mr_.find(sa.data()) == mem_mr_.end()) && (sa_cnt==1)) { // only vals register memory
         struct ibv_mr *temp_mr;
         CHECK (temp_mr = ibv_reg_mr(mem_allocator_->GetPD(), sa.data(), sa.size(),
@@ -528,7 +537,7 @@ class RDMAVan : public Van {
       }
       ++sa_cnt;
     }
-    // register for tensor address of pull request 
+    // register for tensor address of pull request,控制信息不为空，作为worker注册用于PULL回来的数据存放的内存
     if (IsValidPushpull(msg) && !msg.meta.push && msg.meta.request) {
       CHECK_GT(msg.meta.val_len, 0) << msg.meta.val_len;
       auto addr = reinterpret_cast<char*>(msg.meta.addr);
@@ -576,14 +585,14 @@ class RDMAVan : public Van {
 
     mem_allocator_.reset(new MemoryAllocator(pd_));
 
-    comp_event_channel_ = ibv_create_comp_channel(context_);
+    comp_event_channel_ = ibv_create_comp_channel(context_);//创建一个完成通道，完成通道是一种机制，当新的CQE被放置在CQ上时，用户可以接收通知
 
     // TODO(clan): Replace the rough estimate here
     cq_ = ibv_create_cq(context_, kMaxConcurrentWorkRequest * 2, NULL,
                         comp_event_channel_, 0);
 
     CHECK(cq_) << "Failed to create completion queue";
-    CHECK(!ibv_req_notify_cq(cq_, 0)) << "Failed to request CQ notification";
+    CHECK(!ibv_req_notify_cq(cq_, 0)) << "Failed to request CQ notification";//当CQE在CQ中产生时，一个完成事件将会产生，用户使用ibv_get_cq_event操作来接收通知
   }
 
   void ReleaseWorkRequestContext(WRContext *context, Endpoint *endpoint) {
@@ -602,6 +611,7 @@ class RDMAVan : public Van {
     }
   }
 
+  //PollCQ
   void PollCQ() {
     // Pre-allocated work completions array used for polling
     struct ibv_wc wc[kMaxConcurrentWorkRequest];
@@ -626,7 +636,7 @@ class RDMAVan : public Van {
             ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RDMA_WRITE: {
-            // do nothing
+            // do nothing，完成了一个写操作
           } break;
           case IBV_WC_RECV_RDMA_WITH_IMM: {
             uint32_t addr_idx = wc[i].imm_data;
@@ -634,18 +644,18 @@ class RDMAVan : public Van {
             recv_buffers_.Push(std::make_tuple(endpoint, buf_ctx));
             ReleaseWorkRequestContext(context, endpoint);
           } break;
-          case IBV_WC_RECV: {
+          case IBV_WC_RECV: {//收到了对端的一个消息
             CHECK(wc[i].wc_flags & IBV_WC_WITH_IMM);
             uint32_t imm = wc[i].imm_data;
             struct ibv_mr *mr = context->buffer;
 
-            if (imm == kRendezvousStart) {
-              RendezvousStart *req =
+            if (imm == kRendezvousStart) {//表示是对端第一次发过来的消息，对端此时采用的是send，需要将本端的地址和rkey发送至对方
+              RendezvousStart *req =//reinterpret允许将任何指针转换为其他指针类型。它允许将任何整数类型转换为任何指针以及反向转换。
                   reinterpret_cast<RendezvousStart *>(mr->addr);
               auto trans = CHECK_NOTNULL(endpoint->GetTransport());
               trans->SendRendezvousReply(req, addr_pool_);
               
-            } else if (imm == kRendezvousReply) {
+            } else if (imm == kRendezvousReply) {//表示收到对端发来的地址信息
               RendezvousReply *resp =
                   reinterpret_cast<RendezvousReply *>(mr->addr);
               uint64_t remote_addr = resp->addr;
@@ -657,10 +667,10 @@ class RDMAVan : public Van {
                   reinterpret_cast<MessageBuffer *>(origin_addr);
 
               // Before RDMA write, store the remote info so that
-              // subsequent write does not need repeated rendezvous
+              // subsequent write does not need repeated rendezvous//将对端需要的key的地址保存下来，下次发送该key的数据时可以直接写
               StoreRemoteAndLocalInfo(msg_buf, remote_addr, rkey, idx);
 
-              Message *msg = GetFirstMsg(msg_buf);
+              Message *msg = GetFirstMsg(msg_buf);//返回用于接收数据的内存的首地址
 
               auto addr_tuple = GetRemoteAndLocalInfo(msg->meta.key, msg->meta.push, msg->meta.recver);
 
@@ -669,7 +679,7 @@ class RDMAVan : public Van {
               auto trans = CHECK_NOTNULL(endpoint->GetTransport());
               if (!IsValidPushpull(*msg)) {
                 // control message
-                trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+                trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);//收到对端写过来的地址信息，需要将自己本端的地址信息和rkey也告知对端
               } else if (msg->meta.push && msg->meta.request) { 
                 // worker, push request
                 trans->SendPushRequest(*msg, msg_buf, addr_tuple);
@@ -704,7 +714,7 @@ class RDMAVan : public Van {
   }
 
   void PollEvents() {
-    int flags = fcntl(event_channel_->fd, F_GETFL);
+    int flags = fcntl(event_channel_->fd, F_GETFL);//flags获得文件状态标记
     int rc = fcntl(event_channel_->fd, F_SETFL, flags | O_NONBLOCK);
     CHECK_GE(rc, 0);
     int error_flags = POLLERR | POLLHUP | POLLNVAL;
@@ -723,21 +733,21 @@ class RDMAVan : public Van {
 
       struct rdma_cm_event *event;
       CHECK_EQ(rdma_get_cm_event(event_channel_, &event), 0);
-      // TODO(clan): Reorder the list according to the event frequency
+      // TODO(clan): Reorder the list according to the event frequency，此处相当于将client和server写到了一起
       switch (event->event) {
-        case RDMA_CM_EVENT_CONNECT_REQUEST:
+        case RDMA_CM_EVENT_CONNECT_REQUEST://server
           OnConnectRequest(event);
           break;
-        case RDMA_CM_EVENT_ADDR_RESOLVED:
+        case RDMA_CM_EVENT_ADDR_RESOLVED://client
           OnAddrResolved(event);
           break;
-        case RDMA_CM_EVENT_ROUTE_RESOLVED:
+        case RDMA_CM_EVENT_ROUTE_RESOLVED://client，代表rdma_resolve_route路由解析成功完成
           OnRouteResolved(event);
           break;
-        case RDMA_CM_EVENT_ESTABLISHED:
+        case RDMA_CM_EVENT_ESTABLISHED://client，server
           OnConnected(event);
           break;
-        case RDMA_CM_EVENT_DISCONNECTED:
+        case RDMA_CM_EVENT_DISCONNECTED://client，server
           OnDisconnected(event);
           break;
         case RDMA_CM_EVENT_REJECTED:
@@ -782,19 +792,19 @@ class RDMAVan : public Van {
     CHECK_NOTNULL(event->param.conn.private_data);
 
     const RequestContext *remote_ctx = reinterpret_cast<const RequestContext *>(
-        event->param.conn.private_data);
+        event->param.conn.private_data);//private_data字段为用户调用rdma_connect或rdma_accept时指定的结构体，此处指定了一个RequestContext
 
-    const auto r = incoming_.emplace(std::make_unique<Endpoint>());
-    Endpoint *endpoint = r.first->get();
-    endpoint->SetNodeID(remote_ctx->node);
+    const auto r = incoming_.emplace(std::make_unique<Endpoint>());//因为自己是server，所以会有client向自己发起一个连接
+    Endpoint *endpoint = r.first->get();//一个Endpoint表示一个rdma连接
+    endpoint->SetNodeID(remote_ctx->node);//表示对端的node信息
     endpoint->cm_id = id;
     id->context = endpoint;
 
     if (context_ == nullptr) {
-      InitContext(id->verbs);
+      InitContext(id->verbs);//初始化资源，ibv_create_comp_channel
     }
 
-    endpoint->Init(cq_, pd_);
+    endpoint->Init(cq_, pd_);//在本端初始化这个endpoint连接的信息
 
 
     bool is_local_node = disable_ipc_ ? false :
@@ -823,14 +833,14 @@ class RDMAVan : public Van {
     cm_params.private_data = &ctx;
     cm_params.private_data_len = sizeof(RequestContext);
 
-    CHECK_EQ(rdma_accept(id, &cm_params), 0)
+    CHECK_EQ(rdma_accept(id, &cm_params), 0)//在监听端调用rdma_accept来接收连接
         << "Accept RDMA connection failed: " << strerror(errno);
   }
 
   // Resolve a route after address is resolved
   void OnAddrResolved(struct rdma_cm_event *event) {
     struct rdma_cm_id *id = event->id;
-    CHECK_EQ(rdma_resolve_route(id, kTimeoutms), 0)
+    CHECK_EQ(rdma_resolve_route(id, kTimeoutms), 0)//将RDMA路由解析到目的地址，以便建立连接。
         << "Resolve RDMA route failed";
   }
 
@@ -843,7 +853,7 @@ class RDMAVan : public Van {
       InitContext(id->verbs);
     }
 
-    endpoint->Init(cq_, pd_);
+    endpoint->Init(cq_, pd_);//自己作为client，初始化cq和pd
 
     RequestContext ctx;
     ctx.node = static_cast<uint32_t>(my_node_.id);
@@ -857,7 +867,7 @@ class RDMAVan : public Van {
     cm_params.private_data = &ctx;
     cm_params.private_data_len = sizeof(RequestContext);
 
-    CHECK_EQ(rdma_connect(id, &cm_params), 0)
+    CHECK_EQ(rdma_connect(id, &cm_params), 0)//发起一个活动连接请求，
         << "RDMA connect failed" << strerror(errno);
   }
 
@@ -867,7 +877,7 @@ class RDMAVan : public Van {
     Endpoint *endpoint = reinterpret_cast<Endpoint *>(id->context);
     CHECK(endpoint) << "Endpoint not found.";
 
-    if (cq_polling_thread_ == nullptr) {
+    if (cq_polling_thread_ == nullptr) {//如果此时负责poll cq的线程还未开启，则开启
       cq_polling_thread_.reset(new std::thread(&RDMAVan::PollCQ, this));
     }
 
