@@ -155,7 +155,7 @@ class RDMAVan : public Van {
     return port;
   }
 
-  void Connect(const Node &node) override {
+  void Connect(const Node &node) override {//表示去本端去连接node这个节点
     PS_VLOG(1) << "Connecting to Node " << node.id << ", My_Node=" << my_node_.id;
     CHECK_NE(node.id, node.kEmpty);
     CHECK_NE(node.port, node.kEmpty);
@@ -168,9 +168,9 @@ class RDMAVan : public Van {
 
     if (node.id != Node::kEmpty) {
       endpoints_mu_.lock();
-      auto it = endpoints_.find(node.id);
+      auto it = endpoints_.find(node.id);//endpoints_保持RDMA中的连接信息，与node相应节点的连接信息
 
-      // if there is an endpoint with pending connection，如果已经有一个连接，则先把该连接删除
+      // if there is an endpoint with pending connection，如果本端已经与这个node.id有rdma连接，则先删除
       if (it != endpoints_.end()) {
         endpoints_.erase(it);
       }
@@ -251,11 +251,11 @@ class RDMAVan : public Van {
 
   //初始化环境后，最开始先由worker发起一个SendMsg，里面包含相关信息
   int SendMsg(Message &msg) override {
-    int remote_id = msg.meta.recver;
+    int remote_id = msg.meta.recver;//这个msg的接收端
     CHECK_NE(remote_id, Meta::kEmpty);
 
     endpoints_mu_.lock();
-    CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
+    CHECK_NE(endpoints_.find(remote_id), endpoints_.end());//endpoints_表示对端的server节点组成的集合
     Endpoint *endpoint = endpoints_[remote_id].get();
     endpoints_mu_.unlock();
 
@@ -264,7 +264,7 @@ class RDMAVan : public Van {
     size_t total_len = meta_len + data_len;//消息总长度
     CHECK(meta_len);
 
-    RegisterMemory(msg);//将msg中所含的信息地址内存都注册
+    RegisterMemory(msg);//为msg中所含数据块中的vals注册内存
 
     // pack meta info
     if (IsValidPushpull(msg)) {//若控制信息为空，则将本地地址的rkey加入到meta中
@@ -275,8 +275,8 @@ class RDMAVan : public Van {
 
     // start rendezvous if no remote info
     if (!IsValidPushpull(msg)) {//控制信息不为空，
-      MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);//为这块msg注册一块内存用来发送
-      StoreMsgBuf(msg_buf, msg);//将msg_buf和msg的对应关系存储下来
+      MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);//为这块msg的meta注册一块内存用来发送数据
+      StoreMsgBuf(msg_buf, msg);//将msg_buf和msg.meta对应关系存储下来
       trans->SendRendezvousBegin(msg, msg_buf);//将这个请求信息发送，但是发送时并没有携带本端的address和rkey
       return total_len;
 
