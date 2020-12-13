@@ -44,7 +44,7 @@ class RDMAVan : public Van {
     if (disable_ipc_) LOG(INFO) << "Shared memory IPC has been disabled";
 
     if (event_channel_ == nullptr) {
-      event_channel_ = rdma_create_event_channel();//创建一个用于接收events的通道
+      event_channel_ = rdma_create_event_channel();//创建一个用于接收events的通道,刚开始创建该通道是为了向schedule发送本地节点信息
       CHECK(event_channel_) << "Create RDMA event channel failed";
 
       //启用一个本地线程来持续监听收到的events
@@ -256,7 +256,7 @@ class RDMAVan : public Van {
 
     endpoints_mu_.lock();
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());//endpoints_表示对端的server节点组成的集合
-    Endpoint *endpoint = endpoints_[remote_id].get();
+    Endpoint *endpoint = endpoints_[remote_id].get();//表示和remote_id匹配的rdma连接
     endpoints_mu_.unlock();
 
     int meta_len = GetPackMetaLen(msg.meta);//消息元数据长度

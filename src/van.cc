@@ -393,7 +393,7 @@ void Van::ProcessAddNodeCommand(Message *msg, Meta *nodes, Meta *recovery_nodes)
 void Van::Start(int customer_id, bool standalone) {
   // get scheduler info
   start_mu_.lock();
-  if (init_stage == 0) {
+  if (init_stage == 0) {//scheduler的信息
     scheduler_.hostname = std::string(CHECK_NOTNULL(Environment::Get()->find("DMLC_PS_ROOT_URI")));
     scheduler_.port = atoi(CHECK_NOTNULL(Environment::Get()->find("DMLC_PS_ROOT_PORT")));
     scheduler_.role = Node::SCHEDULER;
@@ -445,7 +445,7 @@ void Van::Start(int customer_id, bool standalone) {
     CHECK_NE(my_node_.port, -1) << "bind failed";
 
     // connect to the scheduler
-    Connect(scheduler_);//RDMAVan调用的是RDMAVan对应的Connect,各个节点去连接scheduler
+    Connect(scheduler_);//RDMAVan调用的是RDMAVan对应的Connect,各个节点去连接scheduler，即在endpoints_增加这样一个连接，但是没有发送数据
 
     // for debug use
     if (Environment::Get()->find("PS_DROP_MSG")) {
