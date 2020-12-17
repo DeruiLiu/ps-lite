@@ -171,7 +171,10 @@ class FabricVan : public Van {
     event_polling_thread_.reset(new std::thread(&FabricVan::EventPollingThread, this));
     return my_port;
   }
-
+  void M_Connect(const Node &node) override{
+    printf("1\n");
+    return;
+  }
   void Connect(const Node &node) override {
     CHECK_NE(node.id, node.kEmpty);
     CHECK_NE(node.port, node.kEmpty);
