@@ -32,6 +32,10 @@ struct Endpoint {
   std::condition_variable cv;
   std::mutex connect_mu;
   struct rdma_cm_id *cm_id;
+  struct ibv_ah *ah;//组播ud时所需
+  int remote_qpn;//组播ud时所需
+  int remote_qkey;//组播ud时所需
+  std::string multicast_address;
   std::shared_ptr<Transport> trans;//Transport作为父类，可以通过多态来访问子类
 
   int kStartDepth = 128;
@@ -115,6 +119,48 @@ struct Endpoint {
     }
   }
 
+  void MulticastInit(struct ibv_cq *cq,struct ibv_pd *pd,int len){
+    struct ibv_qp_init_attr attr;
+    memset(&attr,0,sizeof(ibv_qp_init_attr));
+    attr.send_cq = cq;
+    attr.recv_cq = cq;
+    attr.cap.max_send_wr = kStartDepth + kReplyDepth;
+    attr.cap.max_recv_wr = kRxDepth;
+    attr.cap.max_send_sge = kSGEntry;
+    attr.cap.max_recv_sge = kSGEntry;
+    attr.qp_type = IBV_QPT_UD;
+    attr.sq_sig_all = 0;
+    int ret = rdma_create_qp(cm_id, pd, &attr);
+    if(ret){
+      printf("multicast create qp failed, ret is %d\n",ret);
+      return;
+    }
+    //CHECK_EQ(rdma_create_qp(cm_id, pd, &attr), 0)
+    //    << "Create RDMA queue pair failed: " << strerror(errno);
+    InitSendContextHelper(pd, start_ctx, &free_start_ctx, kStartDepth,
+                          kRendezvousStartContext);//发送数据时是一块内存
+    InitSendContextHelper(pd, reply_ctx, &free_reply_ctx, kReplyDepth,
+                          kRendezvousReplyContext);//接收数据是一块内存
+    //for (int i = 0; i < kRxDepth; ++i) {
+    for (int i = 0; i < 0; ++i) {
+      void *buf;
+      aligned_malloc((void**) &buf, kMempoolChunkSize);
+      CHECK(buf);
+      struct ibv_mr *mr =
+          ibv_reg_mr(pd, buf, kMempoolChunkSize, IBV_ACCESS_LOCAL_WRITE);
+      CHECK(mr) << "ibv_reg_mr failed: " << strerror(errno) 
+          << "\nYou can try to reduce BYTEPS_RDMA_START_DEPTH (default 128)"
+          << " or BYTEPS_RDMA_RX_DEPTH (default 2048)";
+
+      rx_ctx[i].type = kReceiveContext;
+      rx_ctx[i].buffer = mr;
+      rx_ctx[i].private_data = this;
+      //如果是worker的话，塞1个wr到接收队列中
+      auto role_worker = Postoffice::Get()->is_worker();
+      if(role_worker)
+        MulticastPostRecv(&rx_ctx[i],len);
+    }
+  }
   void Init(struct ibv_cq *cq, struct ibv_pd *pd) {
     struct ibv_qp_init_attr attr;
     memset(&attr, 0, sizeof(ibv_qp_init_attr));
@@ -151,6 +197,22 @@ struct Endpoint {
 
       PostRecv(&rx_ctx[i]);
     }
+  }
+  void MulticastPostRecv(WRContext *ctx,int len){
+  
+    struct ibv_recv_wr wr,*bad_wr = nullptr;
+    memset(&wr,0,sizeof(wr));
+
+    struct ibv_sge sge;
+    sge.addr = reinterpret_cast<uint64_t>(ctx->buffer->addr);
+    sge.length = len;//最大MTU
+    sge.lkey = ctx->buffer->lkey;
+    wr.wr_id = reinterpret_cast<uint64_t>(ctx);
+    wr.next = nullptr;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    CHECK_EQ(ibv_post_recv(cm_id->qp, &wr, &bad_wr), 0)
+        << "ibv_post_recv failed.";
   }
 
   void PostRecv(WRContext *ctx) {
@@ -237,7 +299,7 @@ class RDMATransport : public Transport {
     RendezvousStart *req =
         reinterpret_cast<RendezvousStart *>(context->buffer->addr);
     req->meta_len = msg_buf->inline_len;
-    req->origin_addr = reinterpret_cast<uint64_t>(msg_buf);
+    req->origin_addr = reinterpret_cast<uint64_t>(msg_buf);//地址信息
     req->data_num = msg_buf->data.size();
     for (size_t i = 0; i < req->data_num; ++i) {
       req->data_len[i] = msg.data[i].size();
