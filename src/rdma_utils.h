@@ -136,6 +136,12 @@ class MemoryAllocator {
   std::unordered_map<char *, struct ibv_mr *> mr_;//mr_为本地的一个内存管理池
 };
 
+struct MulticastInfo{
+  std::string addr;
+  struct rdma_cm_id* cm_id;
+  bool used;
+};
+
 struct WRContext {
   WRContextType type;
   struct ibv_mr *buffer;
@@ -178,6 +184,7 @@ struct RequestContext {
   uint16_t port;
   char hostname[kMaxHostnameLength];
 };
+
 
 // <remote_addr, rkey, idx, local_addr> 
 typedef std::tuple<uint64_t, uint32_t, uint32_t, MessageBuffer*> RemoteTuple;  
