@@ -88,6 +88,7 @@ protected:
 
     void Stop() override
     {
+        LOG(INFO) <<" now is stop      ";
         PS_VLOG(1) << my_node_.ShortDebugString() << " is stopping";
         Van::Stop();
 
@@ -112,6 +113,14 @@ protected:
             endpoints_.clear();
         }
 
+        PS_VLOG(1) << "leave multicast ";
+        for(auto &c:m_record){
+            struct addrinfo *remote_addr;
+            CHECK_EQ(getaddrinfo(c.addr.c_str(), nullptr, nullptr, &remote_addr), 0);
+            rdma_leave_multicast(c.cm_id,remote_addr->ai_addr);
+        }
+
+
         PS_VLOG(1) << "Destroying cq and pd.";
         CHECK(!ibv_destroy_cq(cq_)) << "Failed to destroy CQ";
         CHECK(!ibv_destroy_comp_channel(comp_event_channel_)) << "Failed to destroy channel";
@@ -122,6 +131,7 @@ protected:
         // TODO: ibv_dealloc_pd sometimes complains resource busy, need to fix this
         // CHECK(!ibv_dealloc_pd(pd_)) << "Failed to deallocate PD: " <<
         // strerror(errno);
+        
 
         PS_VLOG(1) << "Destroying listener.";
         rdma_destroy_id(listener_);
@@ -166,6 +176,7 @@ protected:
     //自己添加的组播相关代码，如果自己是server，则连接自己绑定的组播地址；如果自己自己是worker，则连接server绑定的组播地址
     void M_Connect(const Node &node)override
     {
+        //LOG(INFO) <<"M_connect is multicast "<< "Connecting to Node " << node.id << ", My_node=" << my_node_.id;
         PS_VLOG(1) << "Connecting to Node " << node.id << ", My_node=" << my_node_.id;
         CHECK_NE(node.id, node.kEmpty);
         CHECK_NE(node.port, node.kEmpty);
@@ -179,6 +190,7 @@ protected:
         if (node.id != Node::kEmpty) {
             Endpoint *endpoint;
             struct addrinfo *remote_addr;
+            std::string multicast_address;
 
             //如果是server的话，则组播时绑定自己的ID信息,一个组播地址只能用于一个组
             
@@ -198,16 +210,19 @@ protected:
 
                 endpoint->SetNodeID(my_node_.id);
                 // 224.224.1.2作为起始地址
-                std::string multicast_address = "224.224.1.";
+                multicast_address = "224.224.1.";
                 int tail = (2 + my_node_.id) % 255;
                 multicast_address += std::to_string(tail);
-                MulticastInfo mm;
-                mm.addr = const_cast<char *>(multicast_address.c_str());
-                mm.used = false;
-                m_record.push_back(mm);  //将本地要连接的组播地址记录下来，方便在event的时候join
+                //MulticastInfo mm;
+                //mm.addr = multicast_address;
+                //mm.used = false;
+                //m_record.push_back(mm);  //将本地要连接的组播地址记录下来，方便在event的时候join
                 CHECK_EQ(getaddrinfo(multicast_address.c_str(), nullptr, nullptr, &remote_addr), 0);
+                //LOG(INFO) << "Connect to Node " << my_node_.id << " with multicast, my role is server";
 
-            } else if (my_node_.role == Node::WORKER) {  //如果是worker的话，则组播时绑定server的id信息
+            } else if(my_node_.role == Node::WORKER && node.role != Node::SERVER){
+                return;
+            }else if (my_node_.role == Node::WORKER) {  //如果是worker的话，则组播时绑定server的id信息
                 m_endpoints_mu_.lock();
                 auto it = m_endpoints_.find(node.id);
                 // if there is an endpoint with pending connection
@@ -219,14 +234,15 @@ protected:
                 m_endpoints_mu_.unlock();
                 endpoint->SetNodeID(node.id);
                 // 224.224.1.2作为起始地址
-                std::string multicast_address = "224.224.1.";
+                multicast_address = "224.224.1.";
                 int tail = (2 + node.id) % 255;
                 multicast_address += std::to_string(tail);
-                struct MulticastInfo mm;
-                mm.addr = const_cast<char *>(multicast_address.c_str());
-                mm.used = false;
-                m_record.push_back(mm);  //将本地要连接的组播地址记录下来，方便在event的时候join
+                //struct MulticastInfo mm;
+                //mm.addr = multicast_address;
+                //mm.used = false;
+                //m_record.push_back(mm);  //将本地要连接的组播地址记录下来，方便在event的时候join
                 CHECK_EQ(getaddrinfo(multicast_address.c_str(), nullptr, nullptr, &remote_addr), 0);
+                //LOG(INFO) << "Connect to Node " << node.id << " with multicast, my role is worker";
             }
 
             while (endpoint->status != Endpoint::CONNECTED) {
@@ -242,34 +258,57 @@ protected:
                 CHECK_EQ(rdma_create_id(event_channel_, &endpoint->cm_id, nullptr, RDMA_PS_UDP), 0)
                     << "Create RDMA connection identifier failed";
                 endpoint->cm_id->context = endpoint;  //此处的context应该指buf，需要分配内存空间
-                
+                MulticastInfo mm;
+                mm.addr = multicast_address;
+                mm.used = false;
+                mm.cm_id=endpoint->cm_id;
+                m_record.push_back(mm);  //将本地要连接的组播地址记录下来，方便在event的时候join
+
+                listen_id_list.push_back(endpoint->cm_id);//将UDP的listen_id记录下来，listen_id_list即表示UDP的id
+
                 auto val = Environment::Get()->find(
                     "DMLC_NODE_HOST_MULTICAST");  //表示自己的地址,为了不与原始ps-lite冲突，故更名为DMLC_NODE_HOST_MULTICAST
                 if (val) {
                     struct addrinfo *addr;
                     auto rc = getaddrinfo(val, "", NULL, &addr);
                     CHECK_EQ(rc, 0) << "getaddrinfo failed: " << gai_strerror(rc);
-                    if (rdma_bind_addr(endpoint->cm_id, addr->ai_addr)) {
-                        printf("multicast bind addr error\n");
-                        return;
-                    }
+                    CHECK_EQ(rdma_bind_addr(endpoint->cm_id, addr->ai_addr),0) << "multicast bind addr error: "<<strerror(errno);
+                    
                     CHECK_EQ(rdma_resolve_addr(endpoint->cm_id, addr->ai_addr, remote_addr->ai_addr, kTimeoutms), 0)
                         << "Resolve RDMA address failed with errno: " << strerror(errno);
+                    LOG(INFO)<<" use my host address "<<val<<" ";
                 } else {  //获得一个本地设备来连接到远程地址
-                    if (rdma_bind_addr(endpoint->cm_id, nullptr)) {
-                        printf("multicast bind addr error\n");
-                        return;
+                    struct sockaddr_in addr;
+                    memset(&addr,0,sizeof(addr));
+                    addr.sin_family = AF_INET;
+                    int port = 20077;
+                    unsigned seed = static_cast<unsigned>(time(NULL) + port);
+                    for (int i = 0; i < 40 + 1; ++i) {
+                        addr.sin_port = htons(port);
+                        if (rdma_bind_addr(endpoint->cm_id,  //将本地地址与rdma_cm_id关联起来
+                                reinterpret_cast<struct sockaddr *>(&addr)) == 0) {
+                            break;
+                        }
+                        if (i == 40) {
+                            port = -1;
+                        } else {
+                            port = 10000 + rand_r(&seed) % 40000;
+                        }
                     }
-                    CHECK_EQ(rdma_resolve_addr(endpoint->cm_id, nullptr, remote_addr->ai_addr, kTimeoutms), 0)
+                    
+                    //CHECK_EQ(rdma_bind_addr(endpoint->cm_id, (struct sockaddr *)(&addr)),0) << "multicast bind addr error: "<<strerror(errno);
+                    CHECK_EQ(rdma_resolve_addr(endpoint->cm_id, reinterpret_cast<struct sockaddr *>(&addr), remote_addr->ai_addr, kTimeoutms), 0)
                         << "Resolve RDMA address failed with errno: " << strerror(errno);
                 }
-
+                LOG(INFO)<<"multicast address is "<<multicast_address<<" remote_addr is "<<remote_addr->ai_addr;
                 endpoint->cv.wait(lk, [endpoint] { return endpoint->status != Endpoint::CONNECTING; });
+
 
                 if (endpoint->status == Endpoint::CONNECTED)
                     break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
+                bool mm_role = (my_node_.role == Node::WORKER);
+                LOG(INFO) << "Connect to Node " << node.id << " with multicast, my role = "<< (mm_role?"worker":"server");
                 //LOG(INFO) << "Connect to Node " << node.id << " with Transport=" << (is_local_node ? "IPC" : "RDMA");
                 // mem_allocator_为RDMAVan的内存分配器，make_shared在动态内存中分配一个对象并初始化它，返回指向此对象的shared_ptr
                 std::shared_ptr<Transport> t = std::make_shared<RDMATransport>(endpoint, mem_allocator_.get());
@@ -885,9 +924,9 @@ protected:
                         OnRejected(event);
                         break;
                     default:
-                        LeaveMulticast(event);
                         CHECK(0) << "OnEvent: unknown event " << event->event << " (" << rdma_event_str(event->event)
                                  << ")";
+                        
                 }
                 rdma_ack_cm_event(event);
             }
@@ -983,7 +1022,6 @@ protected:
             endpoint->remote_qpn = param->qp_num;
             endpoint->remote_qkey = param->qkey;
 
-
             RequestContext ctx;
             ctx.node = static_cast<uint32_t>(my_node_.id);
             ctx.port = static_cast<uint16_t>(my_node_.port);
@@ -995,6 +1033,21 @@ protected:
             if (!endpoint->ah) {
                 printf("mckey: failure creating address handle\n");
                 return;
+            }
+
+
+            if (cq_polling_thread_ == nullptr) {  //如果此时负责poll cq的线程还未开启，则开启
+                cq_polling_thread_.reset(new std::thread(&RDMAVan::PollCQ, this));
+            }
+
+            CHECK_EQ(endpoint->cm_id, id);
+            {
+                std::lock_guard<std::mutex> lk(endpoint->connect_mu);
+                endpoint->status = Endpoint::CONNECTED;
+            }
+            endpoint->cv.notify_all();
+            if (endpoint->node_id != my_node_.id) {
+                PS_VLOG(1) << "OnConnected to Node " << endpoint->node_id;
             }
         }
 
@@ -1015,11 +1068,14 @@ protected:
         void OnAddrResolved(struct rdma_cm_event * event)
         {
             struct rdma_cm_id *id = event->id;
-
-            if (event->listen_id == RDMA_PS_TCP) {               //对应原始情况
+            auto it = std::find(listen_id_list.begin(),listen_id_list.end(),event->id);
+            // if there is an endpoint with pending connection
+            if (it == listen_id_list.end()) {
+                //LOG(INFO) << "tradtional rdma connect OnAddrResolved \n";     
                 CHECK_EQ(rdma_resolve_route(id, kTimeoutms), 0)  //将RDMA路由解析到目的地址，以便建立连接。
                     << "Resolve RDMA route failed";
-            } else {                                                             //对应组播连接的情况
+            }else {    
+                //LOG(INFO) << "multicast OnAddrResolved \n";                                                         //对应组播连接的情况
                 Endpoint *endpoint = reinterpret_cast<Endpoint *>(id->context);  //对应组播的连接
 
                 if (context_ == nullptr) {
@@ -1127,6 +1183,7 @@ protected:
         std::unique_ptr<IPCTransport> ipc_trans_;
 
         struct rdma_cm_id *listener_ = nullptr;
+        std::vector<rdma_cm_id*> listen_id_list;
         std::atomic<bool> should_stop_;
 
         std::mutex endpoints_mu_;
@@ -1141,10 +1198,14 @@ protected:
 
         // ibverbs protection domain
         struct ibv_pd *pd_ = nullptr;
+        //ibverbs protection domain
+        struct ibv_pd *m_pd_ = nullptr;
         // Completion event channel, to wait for work completions
         struct ibv_comp_channel *comp_event_channel_ = nullptr;
         // Completion queue, to poll on work completions
         struct ibv_cq *cq_ = nullptr;
+        //multicast Completion queue, to poll on work completions
+        struct ibv_cq *m_cq_ = nullptr;
         // cq thread
         std::unique_ptr<std::thread> cq_polling_thread_;
         // event thread
@@ -1177,4 +1238,4 @@ protected:
 };  // namespace ps
 
 #endif  // DMLC_USE_RDMA
-#endif  // PS_RDMA_VAN_H_
+#endif  // PS_RDMA_VAN_H_ 
