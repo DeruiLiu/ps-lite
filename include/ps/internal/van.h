@@ -88,6 +88,11 @@ class Van {
   virtual void Connect(const Node &node) = 0;
 
   /**
+  * \brief multicast connect to a node
+  */
+  virtual void M_Connect(const Node &node) = 0;
+
+  /**
    * \brief bind to my node
    * do multiple retries on binding the port. since it's possible that
    * different nodes on the same machine picked the same port
