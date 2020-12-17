@@ -203,13 +203,13 @@ void Van::ProcessAddNodeCommandAtScheduler(Message *msg, Meta *nodes, Meta *reco
     nodes->control.node.push_back(my_node_);
     nodes->control.cmd = Control::ADD_NODE;
     Message back;
-    back.meta = *nodes;
+    back.meta = *nodes;//kWorker和kServer所对应的组成员
     for (int r : Postoffice::Get()->GetNodeIDs(kWorkerGroup + kServerGroup)) {
       int recver_id = r;
       if (shared_node_mapping_.find(r) == shared_node_mapping_.end()) {
         back.meta.recver = recver_id;
         back.meta.timestamp = timestamp_++;
-        Send(back);
+        Send(back);//即scheduler向worker/server发送ADD_NODE的这个连接发送消息
       }
     }
     PS_VLOG(1) << "the scheduler is connected to " << num_workers_ << " workers and "
@@ -378,8 +378,9 @@ void Van::ProcessAddNodeCommand(Message *msg, Meta *nodes, Meta *recovery_nodes)
     for (const auto &node : ctrl.node) {
       std::string addr_str = node.hostname + ":" + std::to_string(node.port);
       if (connected_nodes_.find(addr_str) == connected_nodes_.end()) {
-        Connect(node);
-        connected_nodes_[addr_str] = node.id;
+        Connect(node);//表示worker和server都会收到scheduler发来的ADD_NODE信息，将node信息保存至endpoint_
+        M_Connect(node);//对于worker或者server，也新建一个连接绑定该节点对应的组播地址
+        connected_nodes_[addr_str] = node.id;//保存连接的地址和id的对应关系
       }
       if (!node.is_recovery && node.role == Node::SERVER) ++num_servers_;
       if (!node.is_recovery && node.role == Node::WORKER) ++num_workers_;
@@ -445,7 +446,8 @@ void Van::Start(int customer_id, bool standalone) {
     CHECK_NE(my_node_.port, -1) << "bind failed";
 
     // connect to the scheduler
-    Connect(scheduler_);//RDMAVan调用的是RDMAVan对应的Connect,各个节点去连接scheduler，即在endpoints_增加这样一个连接，但是没有发送数据
+    Connect(scheduler_);//RDMAVan调用的是RDMAVan对应的Connect,各个节点去连接scheduler，在此时自己作为client，连接的节点作为server
+    //连接后endpoint中保存的节点均表示client
 
     // for debug use
     if (Environment::Get()->find("PS_DROP_MSG")) {
@@ -457,7 +459,7 @@ void Van::Start(int customer_id, bool standalone) {
   }
   start_mu_.unlock();
 
-  if (!is_scheduler_) {//即对于worker节点和server节点需要发送
+  if (!is_scheduler_) {//即对于worker节点和server节点需要发送,先向scheduler发送ADD_NODE信息
     // let the scheduler know myself
     Message msg;
     Node customer_specific_node = my_node_;
