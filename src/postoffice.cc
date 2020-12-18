@@ -56,7 +56,7 @@ void Postoffice::Start(int customer_id, const char* argv0, const bool do_barrier
       for (int g : {id, kWorkerGroup, kWorkerGroup + kServerGroup,//id,4,6,5,7
                     kWorkerGroup + kScheduler,
                     kWorkerGroup + kServerGroup + kScheduler}) {
-        node_ids_[g].push_back(id);
+        node_ids_[g].push_back(id);//node_ids_保存了node/nodegroup与连接节点集合的对应关系
       }
     }
 
@@ -89,6 +89,7 @@ void Postoffice::Start(int customer_id, const char* argv0, const bool do_barrier
   }
   start_mu_.unlock();
   // do a barrier here，
+  //LOG(INFO) << "11111111111111111111111111111111111111111111111";
   if (do_barrier) Barrier(customer_id, kWorkerGroup + kServerGroup + kScheduler);
 }
 
