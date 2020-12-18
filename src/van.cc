@@ -379,9 +379,12 @@ void Van::ProcessAddNodeCommand(Message *msg, Meta *nodes, Meta *recovery_nodes)
       std::string addr_str = node.hostname + ":" + std::to_string(node.port);
       if (connected_nodes_.find(addr_str) == connected_nodes_.end()) {
         Connect(node);//表示worker和server都会收到scheduler发来的ADD_NODE信息，将node信息保存至endpoint_
+        LOG(INFO) << "Connect node complete";
         M_Connect(node);//对于worker或者server，也新建一个连接绑定该节点对应的组播地址
+        LOG(INFO) << "M_Connect node complete";
         connected_nodes_[addr_str] = node.id;//保存连接的地址和id的对应关系
       }
+      LOG(INFO) << "it is time to connect "<<my_node_.role << "   "<<my_node_.id<<"   "<<node.id;
       if (!node.is_recovery && node.role == Node::SERVER) ++num_servers_;
       if (!node.is_recovery && node.role == Node::WORKER) ++num_workers_;
     }
@@ -438,7 +441,7 @@ void Van::Start(int customer_id, bool standalone) {
       SetNode(node);
     }
 
-    //bind和Connect在Van中均为纯虚函数，需要要子类重写
+    //bind和Connect在Van中均为纯虚函数，需要子类重写
     // bind.即各个节点启用rdma绑定一个端口，//RDMAVan调用的是RDMAVan对应的Bind
     //即相当于每个节点都在本地启用一个server端
     my_node_.port = Bind(my_node_, is_scheduler_ ? 0 : 40);
