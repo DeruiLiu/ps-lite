@@ -148,11 +148,29 @@ struct WRContext {
   void *private_data;
 };
 
+struct MultWRContext{
+  uint32_t node_id;
+  uint32_t lkey;
+  char* buffer;
+  size_t len;
+  void *private_data;
+};
+
+//判断worker是否收到了server发来的pull response请求
+struct RPRContext{
+  uint32_t node_id;
+  char *buffer;
+  size_t len;
+  uint32_t lkey;
+};
+
 struct RendezvousStart {
   uint64_t meta_len;
   uint64_t data_num;
   uint64_t data_len[kMaxDataFields];
   uint64_t origin_addr;
+  bool request;
+  bool push;
 };
 
 struct RendezvousReply {
