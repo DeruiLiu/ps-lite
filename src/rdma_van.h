@@ -346,7 +346,7 @@ protected:
                       << " with multicast, my role = " << (mm_role ? "worker" : "server");
             // LOG(INFO) << "Connect to Node " << node.id << " with Transport=" << (is_local_node ? "IPC" : "RDMA");
             // mem_allocator_为RDMAVan的内存分配器，make_shared在动态内存中分配一个对象并初始化它，返回指向此对象的shared_ptr
-            std::shared_ptr<Transport> t = std::make_shared<RDMATransport>(endpoint, m_mem_allocator_.get());
+            std::shared_ptr<Transport> t = std::make_shared<RDMATransport>(endpoint, mem_allocator_.get());
             endpoint->SetTransport(t);
             freeaddrinfo(remote_addr);
         }
@@ -447,36 +447,39 @@ protected:
         Endpoint *endpoint = endpoints_[remote_id].get();        //表示和remote_id匹配的rdma连接,取出该连接
         endpoints_mu_.unlock();
 
-        int meta_len = GetPackMetaLen(msg.meta);  //消息元数据长度
-        size_t data_len = msg.meta.data_size;     //消息数据体长度，数据是由类似vector组成
-        size_t total_len = meta_len + data_len;   //消息总长度
+        int meta_len = GetPackMetaLen(msg.meta);  // msg元数据长度
+        size_t data_len = msg.meta.data_size;     // msg数据体长度，数据是由类似vector组成
+        size_t total_len = meta_len + data_len;   // msg总长度
         CHECK(meta_len);
 
-        RegisterMemory(msg);  //为msg中所含数据块中的vals注册内存
+        RegisterMemory(msg);  //注册这块内存有啥用？
+        //该函数第一次调用时注册了msg的vals所在的内存，用于worker push数据时能够将该数据发送，也可以用于server
+        // pull数据时将该数据发送 同时注册了msg的meta.address所在的内存，用于worker pull request时接收该数据所在的内存，
 
         // pack meta info
-        if (IsValidPushpull(msg)) {  //若控制信息为空，则将本地地址的rkey加入到meta中
+        if (IsValidPushpull(msg)) {
+            //若控制信息为空，如果是worker的pull request请求，则将本地meta数据注册内存的rkey加入到msg中
             AddMeta(msg);
         }
 
         auto trans = CHECK_NOTNULL(endpoint->GetTransport());
-
         // start rendezvous if no remote info
-        if (!IsValidPushpull(msg)) {                         //控制信息不为空，
+        if (!IsValidPushpull(msg)) {  //控制信息不为空，即此时并不是push或pull的数据或请求
             MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);  //为这块msg的meta注册一块内存用来发送数据
             StoreMsgBuf(msg_buf, msg);                       //将msg_buf和msg.meta对应关系存储下来
             trans->SendRendezvousBegin(msg, msg_buf);  //将这个请求信息发送，但是发送时并没有携带本端的address和rkey
             return total_len;
 
-        } else {  //控制信息为空，则表示传数据？
+        } else {  //控制信息为空，则表示传数据或数据请求？
             auto is_push = msg.meta.push;
             auto key = msg.meta.key;
 
             if (!HasRemoteInfo(msg, key, is_push, remote_id)) {  //这个时候如果没有远端的地址信息
-                MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);  //为这块msg注册一块内存用来发送
+                MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);  //将该msg的meta data内存注册发送至对端，
                 StoreMsgBuf(msg_buf, msg);                       //将msg_buf和msg的对应关系存储下来
                 PrepareData(msg, msg_buf);
-                trans->SendRendezvousBegin(msg, msg_buf);  //将这个请求信息发送，但是发送时并没有携带本端的address和rkey
+                trans->SendRendezvousBegin(msg, msg_buf);
+                //此时将meta发送至对端，对端收到该请求后会根据meta将自己的地址信息返回
                 return total_len;
             }
         }
@@ -487,8 +490,8 @@ protected:
         // prepare new meta and data
         CHECK_EQ(msg_buf->inline_len, (size_t)meta_len);
         CHECK(msg_buf->inline_buf);
-        msg_buf->data = msg.data;  // may not need this
-        PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
+        msg_buf->data = msg.data;                               // may not need this
+        PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);  //拷贝meta
 
         PrintSendLog(msg, msg_buf, addr_tuple);
 
@@ -503,10 +506,12 @@ protected:
         } else if (!msg.meta.push && msg.meta.request) {
             // worker, pull request
             trans->SendPullRequest(msg, msg_buf, addr_tuple);
+            //此时同时提交wr到接收队列，用以接收组播收到的数据.
+
         } else if (!msg.meta.push && !msg.meta.request) {
             // server, pull response
             map_mu_.lock();
-            auto temp_mr = mem_mr_.find(msg_buf->data[1].data());
+            auto temp_mr = mem_mr_.find(msg_buf->data[1].data());  //表示vals对应的mr
             CHECK_NE(temp_mr, mem_mr_.end());
             map_mu_.unlock();
             trans->SendPullResponse(msg, msg_buf, addr_tuple, temp_mr->second->lkey);
@@ -691,7 +696,7 @@ private:
     MessageBuffer *PrepareNewMsgBuf(Message &msg)
     {
         MessageBuffer *msg_buf = new MessageBuffer();
-        auto meta_len = GetPackMetaLen(msg.meta);  //获取元数据的长度
+        auto meta_len = GetPackMetaLen(msg.meta);  //获取meta数据的总长度
         msg_buf->inline_len = meta_len;
         msg_buf->inline_buf = mem_allocator_->Alloc(meta_len);  //注册meta_len大小的内存
         msg_buf->data = msg.data;                               // data包含keys,vals,lens
@@ -702,11 +707,12 @@ private:
     void RegisterMemory(Message &msg)
     {
         size_t sa_cnt = 0;
-        for (auto &sa : msg.data) {  // msg.data是一个vector数组，即不一定是连续的数据块，
+        for (auto &sa : msg.data) {  // msg.data是一个vector数组，data[0]=keys,data[1]=vals,data[2]=lens
             if (sa.size() == 0)
                 continue;
             std::lock_guard<std::mutex> lock(map_mu_);  // sa.data()即返回sa保存的指针，data应该分为keys,vals,lens
-            if ((mem_mr_.find(sa.data()) == mem_mr_.end()) && (sa_cnt == 1)) {  // only vals register memory
+            if ((mem_mr_.find(sa.data()) == mem_mr_.end()) &&
+                (sa_cnt == 1)) {  // only vals register memory，用于之后发送数据时能够将该内存所在的vals发送
                 struct ibv_mr *temp_mr;
                 CHECK(temp_mr = ibv_reg_mr(mem_allocator_->GetPD(),
                           sa.data(),
@@ -717,7 +723,8 @@ private:
             }
             ++sa_cnt;
         }
-        // register for tensor address of pull request,控制信息不为空，作为worker注册用于PULL回来的数据存放的内存
+        // register for tensor address of pull request 即对于worker来说，所有的pull
+        // request都需要注册内存，这一步是在干嘛？
         if (IsValidPushpull(msg) && !msg.meta.push && msg.meta.request) {
             CHECK_GT(msg.meta.val_len, 0) << msg.meta.val_len;
             auto addr = reinterpret_cast<char *>(msg.meta.addr);
@@ -725,7 +732,7 @@ private:
             if (mem_mr_.find(addr) == mem_mr_.end()) {
                 struct ibv_mr *temp_mr;
                 CHECK(temp_mr = ibv_reg_mr(mem_allocator_->GetPD(),
-                          addr,
+                          addr,  //此处的addr和上面的sa.sata有什么不同？
                           msg.meta.val_len,
                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
                     << "Failed to register the memory region: " << strerror(errno);
@@ -736,8 +743,8 @@ private:
 
     void PrepareData(Message &msg, MessageBuffer *msg_buf)
     {
-        if (!(msg.meta.push && msg.meta.request))
-            return;  // only push request
+        if (!(msg.meta.push && msg.meta.request))  //只有当worker push数据，该函数才会进一步调用
+            return;                                // only push request
         auto &sa = msg_buf->data[1];
         if (sa.size() == 0)
             return;
@@ -763,15 +770,15 @@ private:
     }
     void MulticastInitContext(struct ibv_context *context)
     {
-        m_context_ = context;
-        CHECK(m_context_) << "ibv_context * empty";
-        m_pd_ = ibv_alloc_pd(m_context_);
-        CHECK(m_pd_) << "Failed to allocate protection domain";
+        //m_context_ = context;
+        //CHECK(m_context_) << "ibv_context * empty";
+        //m_pd_ = ibv_alloc_pd(m_context_);
+        //CHECK(pd_) << "Failed to allocate protection domain";
 
-        m_mem_allocator_.reset(new MemoryAllocator(m_pd_));
-        m_comp_event_channel_ = ibv_create_comp_channel(m_context_);
+        //m_mem_allocator_.reset(new MemoryAllocator(pd_));
+        m_comp_event_channel_ = ibv_create_comp_channel(context_);
 
-        m_cq_ = ibv_create_cq(m_context_, kMaxConcurrentWorkRequest * 2, NULL, comp_event_channel_, 0);
+        m_cq_ = ibv_create_cq(context_, kMaxConcurrentWorkRequest * 2, NULL, m_comp_event_channel_, 0);
 
         CHECK(m_cq_) << "Failed to create completion queue";
         CHECK(!ibv_req_notify_cq(m_cq_, 0))
@@ -780,15 +787,15 @@ private:
     void InitContext(struct ibv_context *context)
     {
         context_ = context;
-        CHECK(context_) << "ibv_context* empty";
+        CHECK(m_context_) << "ibv_context* empty";
 
         pd_ = ibv_alloc_pd(context_);
         CHECK(pd_) << "Failed to allocate protection domain";
 
         mem_allocator_.reset(new MemoryAllocator(pd_));
 
-        comp_event_channel_ = ibv_create_comp_channel(
-            context_);  //创建一个完成通道，完成通道是一种机制，当新的CQE被放置在CQ上时，用户可以接收通知
+        comp_event_channel_ = ibv_create_comp_channel(context_);
+        //创建一个完成通道，完成通道是一种机制，当新的CQE被放置在CQ上时，用户可以接收通知
 
         // TODO(clan): Replace the rough estimate here
         cq_ = ibv_create_cq(context_, kMaxConcurrentWorkRequest * 2, NULL, comp_event_channel_, 0);
@@ -818,10 +825,9 @@ private:
     void m_PollCQ()
     {
         // Pre-allocated work completions array used for polling
-        struct ibv_wc wc[kMaxConcurrentWorkRequest];
+        struct ibv_wc wc[2048];
         while (!should_stop_.load()) {
-            break;
-            int ne = ibv_poll_cq(m_cq_, kMaxConcurrentWorkRequest, wc);
+            int ne = ibv_poll_cq(m_cq_, 2048, wc);
             CHECK_GE(ne, 0);
             for (int i = 0; i < ne; ++i) {
                 LOG(INFO) << " this is multicast pollcq ";
@@ -829,93 +835,20 @@ private:
                                                       << ibv_wc_status_str(wc[i].status) << " " << wc[i].status << " "
                                                       << static_cast<uint64_t>(wc[i].wr_id) << " " << wc[i].vendor_err;
 
-                WRContext *context = reinterpret_cast<WRContext *>(wc[i].wr_id);
-                Endpoint *endpoint =
-                    reinterpret_cast<Endpoint *>(context->private_data);  // private_data指向一个endpoint的指针？
-                // endpoint即得到了这个连接，不管是作为server还是client。
+                MultWRContext *context = reinterpret_cast<MultWRContext *>(wc[i].wr_id);
+                Endpoint *endpoint = reinterpret_cast<Endpoint *>(context->private_data);
+                // private_data指向一个endpoint的指针,夹带的私货
+                // endpoint即得到了这个组播连接，不管是作为server还是client。
 
                 // IBV_WC_RDMA_WRITE use msg_buf as the wr_id
                 // so there won't be context and endpoint for this op
                 switch (wc[i].opcode) {
-                    case IBV_WC_SEND: {  // Send operation for a wr that was posted to the Send Queue
-                        ReleaseWorkRequestContext(context, endpoint);
-                    } break;
-                    case IBV_WC_RDMA_WRITE: {  // RDMA write operation for a WR that was posted to the Send Queue
-                        // do nothing，完成了一个写操作
-                    } break;
-                    case IBV_WC_RECV_RDMA_WITH_IMM: {  // RDMA with immediate for a WR that was posted to a Receive
-                                                       // Queue
-                        uint32_t addr_idx = wc[i].imm_data;
-                        BufferContext *buf_ctx = addr_pool_.GetAddress(addr_idx);
-                        recv_buffers_.Push(std::make_tuple(endpoint, buf_ctx));
-                        ReleaseWorkRequestContext(context, endpoint);
-                    } break;
                     case IBV_WC_RECV: {  // Send data operation for a WR that was posted to a Receive
-                                         // Queue,即收到数据
-                        CHECK(wc[i].wc_flags & IBV_WC_WITH_IMM);
-                        uint32_t imm = wc[i].imm_data;
-                        struct ibv_mr *mr = context->buffer;
+                        // Queue
+                        // 对应组播收到数据后不用再去管，因为meta会以写的方式发送给worker，当worker收到meta时，证明data已经拷贝到了指定的内存
 
-                        if (imm ==
-                            kRendezvousStart) {  //表示是对端第一次发过来的消息，对端此时采用的是send，需要将本端的地址和rkey发送至对方，比如client首次push数据
-                            RendezvousStart *
-                                req =  // reinterpret允许将任何指针转换为其他指针类型。它允许将任何整数类型转换为任何指针以及反向转换。
-                                reinterpret_cast<RendezvousStart *>(mr->addr);
-                            auto trans = CHECK_NOTNULL(endpoint->GetTransport());
-                            trans->SendRendezvousReply(req, addr_pool_);
-
-                        } else if (imm == kRendezvousReply) {  //表示收到对端发来的地址信息
-                            RendezvousReply *resp = reinterpret_cast<RendezvousReply *>(mr->addr);
-                            uint64_t remote_addr = resp->addr;
-                            uint64_t origin_addr = resp->origin_addr;
-                            uint32_t rkey = resp->rkey;
-                            uint32_t idx = resp->idx;
-
-                            MessageBuffer *msg_buf = reinterpret_cast<MessageBuffer *>(origin_addr);
-
-                            // Before RDMA write, store the remote info so that
-                            // subsequent write does not need repeated
-                            // rendezvous//将对端需要的key的地址保存下来，下次发送该key的数据时可以直接写
-                            StoreRemoteAndLocalInfo(msg_buf, remote_addr, rkey, idx);
-
-                            Message *msg = GetFirstMsg(msg_buf);  //返回用于接收数据的内存的首地址
-
-                            auto addr_tuple = GetRemoteAndLocalInfo(msg->meta.key, msg->meta.push, msg->meta.recver);
-
-                            PrintSendLog(*msg, msg_buf, addr_tuple);
-
-                            auto trans = CHECK_NOTNULL(endpoint->GetTransport());
-                            if (!IsValidPushpull(*msg)) {
-                                // control message
-                                trans->RDMAWriteWithImm(msg_buf,
-                                    remote_addr,
-                                    rkey,
-                                    idx);  //收到对端写过来的地址信息，需要将自己本端的地址信息和rkey也告知对端
-                            } else if (msg->meta.push && msg->meta.request) {
-                                // worker, push request
-                                trans->SendPushRequest(*msg, msg_buf, addr_tuple);
-                            } else if (msg->meta.push && !msg->meta.request) {
-                                // server, push response
-                                trans->SendPushResponse(*msg, msg_buf, addr_tuple);
-                            } else if (!msg->meta.push && msg->meta.request) {
-                                // worker, pull request
-                                trans->SendPullRequest(*msg, msg_buf, addr_tuple);
-                            } else if (!msg->meta.push && !msg->meta.request) {
-                                // server, pull response
-                                map_mu_.lock();
-                                auto temp_mr = mem_mr_.find(msg_buf->data[1].data());
-                                CHECK_NE(temp_mr, mem_mr_.end());
-                                map_mu_.unlock();
-                                trans->SendPullResponse(*msg, msg_buf, addr_tuple, temp_mr->second->lkey);
-                            }
-
-                            // release the msg_buf from msgbuf_cache_
-                            ReleaseFirstMsg(msg_buf);
-
-                        } else {
-                            CHECK(0);
-                        }
-                        ReleaseWorkRequestContext(context, endpoint);
+                        endpoint->MultPostRecvWR(*context);
+                        // ReleaseWorkRequestContext(context, endpoint);
                     } break;
                     default:
                         CHECK(0) << "Unexpected opcode: " << wc[i].opcode;
@@ -952,7 +885,7 @@ private:
                         // do nothing，完成了一个写操作
                     } break;
                     case IBV_WC_RECV_RDMA_WITH_IMM: {  // RDMA with immediate for a WR that was posted to a Receive
-                                                       // Queue
+                                                       // Queue，即表示收到了对端的一个imm的写数据，此时收到的是meta
                         uint32_t addr_idx = wc[i].imm_data;
                         BufferContext *buf_ctx = addr_pool_.GetAddress(addr_idx);
                         recv_buffers_.Push(std::make_tuple(endpoint, buf_ctx));
@@ -964,13 +897,34 @@ private:
                         uint32_t imm = wc[i].imm_data;
                         struct ibv_mr *mr = context->buffer;
 
-                        if (imm ==
-                            kRendezvousStart) {  //表示是对端第一次发过来的消息，对端此时采用的是send，需要将本端的地址和rkey发送至对方，比如client首次push数据
+                        if (imm == kRendezvousStart) {
+                            //表示是对端第一次发过来的消息，对端此时采用的是send，需要将本端的地址和rkey发送至对方，比如client首次push数据
                             RendezvousStart *
                                 req =  // reinterpret允许将任何指针转换为其他指针类型。它允许将任何整数类型转换为任何指针以及反向转换。
                                 reinterpret_cast<RendezvousStart *>(mr->addr);
                             auto trans = CHECK_NOTNULL(endpoint->GetTransport());
-                            trans->SendRendezvousReply(req, addr_pool_);
+                            MultWRContext worker_receive;
+                            worker_receive.node_id = endpoint->node_id;
+                            bool pull_response;
+                            trans->SendRendezvousReply(req, addr_pool_, worker_receive, pull_response);
+                            //即server向worker发送pull response时，worker在向server回地址的同时，提交wr到组播的receive
+                            // queue
+                            if (pull_response) {
+                                // MulticastInitPostRecv();
+                                m_endpoints_mu_.lock();
+                                auto it = m_endpoints_.find(endpoint->node_id);  //找到对应的组播连接
+                                if (it == m_endpoints_.end()) {
+                                    LOG(INFO)
+                                        << "cann't not post wr to the receive queue, because can't find qp connection";
+                                    m_endpoints_mu_.unlock();
+                                } else {
+                                    LOG(INFO) << "i don't know it is correct";
+                                    Endpoint *endpoint = m_endpoints_[endpoint->node_id].get();
+                                    m_endpoints_mu_.unlock();
+                                    // WRContext wrc;
+                                    endpoint->MultPostRecvWR(worker_receive);
+                                }
+                            }
 
                         } else if (imm == kRendezvousReply) {  //表示收到对端发来的地址信息
                             RendezvousReply *resp = reinterpret_cast<RendezvousReply *>(mr->addr);
@@ -986,7 +940,8 @@ private:
                             // rendezvous//将对端需要的key的地址保存下来，下次发送该key的数据时可以直接写
                             StoreRemoteAndLocalInfo(msg_buf, remote_addr, rkey, idx);
 
-                            Message *msg = GetFirstMsg(msg_buf);  //返回用于接收数据的内存的首地址
+                            Message *msg = GetFirstMsg(msg_buf);
+                            // msg_buf为本地数据存放的地址
 
                             auto addr_tuple = GetRemoteAndLocalInfo(msg->meta.key, msg->meta.push, msg->meta.recver);
 
@@ -995,10 +950,7 @@ private:
                             auto trans = CHECK_NOTNULL(endpoint->GetTransport());
                             if (!IsValidPushpull(*msg)) {
                                 // control message
-                                trans->RDMAWriteWithImm(msg_buf,
-                                    remote_addr,
-                                    rkey,
-                                    idx);  //收到对端写过来的地址信息，需要将自己本端的地址信息和rkey也告知对端
+                                trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
                             } else if (msg->meta.push && msg->meta.request) {
                                 // worker, push request
                                 trans->SendPushRequest(*msg, msg_buf, addr_tuple);
@@ -1021,6 +973,8 @@ private:
                             ReleaseFirstMsg(msg_buf);
 
                         } else {
+                            
+                            LOG(INFO)<<" receive multicast message";
                             CHECK(0);
                         }
                         ReleaseWorkRequestContext(context, endpoint);
@@ -1175,8 +1129,8 @@ private:
         ctx.node = static_cast<uint32_t>(my_node_.id);
         ctx.port = static_cast<uint16_t>(my_node_.port);
         snprintf(ctx.hostname, kMaxHostnameLength, "%s", my_node_.hostname.c_str());
-        param->private_data = &ctx;
-        param->private_data_len = sizeof(RequestContext);
+        // param->private_data = &ctx;
+        // param->private_data_len = sizeof(RequestContext);
 
         endpoint->ah = ibv_create_ah(pd_, &param->ah_attr);
         if (!endpoint->ah) {
@@ -1219,7 +1173,7 @@ private:
         struct rdma_cm_id *id = event->id;
         auto it = std::find(listen_id_list.begin(), listen_id_list.end(), event->id);
         // if there is an endpoint with pending connection
-        if (it == listen_id_list.end()) {
+        if (it == listen_id_list.end()) {  //对应RC正常连接
             // LOG(INFO) << "tradtional rdma connect OnAddrResolved \n";
             CHECK_EQ(rdma_resolve_route(id, kTimeoutms), 0)  //将RDMA路由解析到目的地址，以便建立连接。
                 << "Resolve RDMA route failed";
@@ -1227,25 +1181,29 @@ private:
             // LOG(INFO) << "multicast OnAddrResolved \n"; //对应组播连接的情况
             Endpoint *endpoint = reinterpret_cast<Endpoint *>(id->context);  //对应组播的连接
 
-            if (m_context_ == nullptr) {
+            
+            if (m_cq_ == nullptr) {
                 MulticastInitContext(id->verbs);
             }
+            
+            //if (context_ == nullptr) {
+            //    InitContext(id->verbs);
+            //}
 
             //计算最大mtu
             struct ibv_port_attr port_attr;
             int ret = ibv_query_port(id->verbs, id->port_num, &port_attr);
             int len = 1 << (port_attr.active_mtu + 7);  // len表示最大mtu长度
 
-            endpoint->MulticastInit(m_cq_, m_pd_, len);  //自己作为client，初始化cq和pd
-
+            endpoint->MulticastInit(m_cq_, pd_, len);  //自己作为client，创建QP
             RequestContext ctx;
             ctx.node = static_cast<uint32_t>(my_node_.id);
             ctx.port = static_cast<uint16_t>(my_node_.port);
             snprintf(ctx.hostname, kMaxHostnameLength, "%s", my_node_.hostname.c_str());
 
             struct addrinfo *remote_addr;
-            std::string
-                addr;  //找到第一个未加入的组播地址，然后加入。如果是server，则未加入的组播地址只有一个，即为绑定自己的组播地址
+            std::string addr;
+            //找到第一个未加入的组播地址，然后加入。如果是server，则未加入的组播地址只有一个，即为绑定自己的组播地址
             //如果是worker，则未加入的组播地址的个数为server的个数
             for (auto &c : m_record) {
                 if (c.used == false) {
