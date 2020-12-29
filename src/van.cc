@@ -404,6 +404,16 @@ void Van::Start(int customer_id, bool standalone) {
     scheduler_.id = kScheduler;
     is_scheduler_ = Postoffice::Get()->is_scheduler();
 
+    //is_multicast_决定pull流程中是否启用组播
+    /*
+    const char* multicast = Environment::Get()->find("ENABLE_PULL_MULTICAST");
+    if(multicast){
+      std::string role(multicast);
+      is_multicast_ = true;
+    }else{
+      is_multicast_ = false;
+    }
+    */
 
     // get my node info
     if (is_scheduler_) {//如果自己本身是scheduler
