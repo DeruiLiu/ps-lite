@@ -341,12 +341,13 @@ protected:
                     break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
+
             bool mm_role = (my_node_.role == Node::WORKER);
             LOG(INFO) << "Connect to Node " << multicast_address
                       << " with multicast, my role = " << (mm_role ? "worker" : "server");
             // LOG(INFO) << "Connect to Node " << node.id << " with Transport=" << (is_local_node ? "IPC" : "RDMA");
             // mem_allocator_为RDMAVan的内存分配器，make_shared在动态内存中分配一个对象并初始化它，返回指向此对象的shared_ptr
-            std::shared_ptr<Transport> t = std::make_shared<RDMATransport>(endpoint, mem_allocator_.get());
+            std::shared_ptr<Transport> t = std::make_shared<RDMATransport>(endpoint, m_mem_allocator_.get());
             endpoint->SetTransport(t);
             freeaddrinfo(remote_addr);
         }
@@ -514,7 +515,8 @@ protected:
             auto temp_mr = mem_mr_.find(msg_buf->data[1].data());  //表示vals对应的mr
             CHECK_NE(temp_mr, mem_mr_.end());
             map_mu_.unlock();
-            trans->SendPullResponse(msg, msg_buf, addr_tuple, temp_mr->second->lkey);
+            //trans->SendPullResponse(msg, msg_buf, addr_tuple, temp_mr->second->lkey);
+            MultSendData(msg, msg_buf, addr_tuple, temp_mr->second->lkey);
         } else {
             CHECK(0) << "unexpected message type";
         }
@@ -770,10 +772,10 @@ private:
     }
     void MulticastInitContext(struct ibv_context *context)
     {
-        //m_context_ = context;
-        //CHECK(m_context_) << "ibv_context * empty";
+        // m_context_ = context;
+        // CHECK(m_context_) << "ibv_context * empty";
         //m_pd_ = ibv_alloc_pd(m_context_);
-        //CHECK(pd_) << "Failed to allocate protection domain";
+        // CHECK(pd_) << "Failed to allocate protection domain";
 
         //m_mem_allocator_.reset(new MemoryAllocator(pd_));
         m_comp_event_channel_ = ibv_create_comp_channel(context_);
@@ -784,10 +786,11 @@ private:
         CHECK(!ibv_req_notify_cq(m_cq_, 0))
             << "Failed to request CQ notification";  //当CQE在CQ中产生时，一个完成事件将会产生，用户使用ibv_get_cq_event操作来接收通知
     }
+
     void InitContext(struct ibv_context *context)
     {
         context_ = context;
-        CHECK(m_context_) << "ibv_context* empty";
+        CHECK(context_) << "ibv_context* empty";
 
         pd_ = ibv_alloc_pd(context_);
         CHECK(pd_) << "Failed to allocate protection domain";
@@ -835,7 +838,7 @@ private:
                                                       << ibv_wc_status_str(wc[i].status) << " " << wc[i].status << " "
                                                       << static_cast<uint64_t>(wc[i].wr_id) << " " << wc[i].vendor_err;
 
-                MultWRContext *context = reinterpret_cast<MultWRContext *>(wc[i].wr_id);
+                WRContext *context = reinterpret_cast<WRContext *>(wc[i].wr_id);
                 Endpoint *endpoint = reinterpret_cast<Endpoint *>(context->private_data);
                 // private_data指向一个endpoint的指针,夹带的私货
                 // endpoint即得到了这个组播连接，不管是作为server还是client。
@@ -843,11 +846,20 @@ private:
                 // IBV_WC_RDMA_WRITE use msg_buf as the wr_id
                 // so there won't be context and endpoint for this op
                 switch (wc[i].opcode) {
+                    case IBV_WC_SEND: {  // Send operation for a wr that was posted to the Send Queue
+                        endpoint->free_start_ctx.Push(context);
+                    } break;
                     case IBV_WC_RECV: {  // Send data operation for a WR that was posted to a Receive
                         // Queue
-                        // 对应组播收到数据后不用再去管，因为meta会以写的方式发送给worker，当worker收到meta时，证明data已经拷贝到了指定的内存
-
-                        endpoint->MultPostRecvWR(*context);
+                        // 对应组播收到数据需要将数据拷贝至key所在的地址，并同时塞入新的wr到接收队列
+                        // 此时应该同时判断，如果自己的角色为server的话，则直接塞wr到接收队列，防止交换机未配静态组播组导致地址越界
+                        struct ibv_mr *mr = context->buffer;
+                        MultMsgMeta *MultMeta = reinterpret_cast<MultMsgMeta *>(mr->addr);
+                        //auto idx = MultMeta->idx;
+                        auto addr = reinterpret_cast<char *>(MultMeta->addr);
+                        auto len = MultMeta->len;
+                        memcpy(MultMeta+sizeof(MultMeta->addr) + sizeof(MultMeta->len), addr, len);
+                        endpoint->MulticastPostRecv(context);
                         // ReleaseWorkRequestContext(context, endpoint);
                     } break;
                     default:
@@ -856,6 +868,34 @@ private:
             }
         }
     }
+
+
+    void MultSendData(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple, size_t lkey){
+        //MultSendData(*msg, msg_buf, addr_tuple, temp_mr->second->lkey);
+        // multicast发送数据时需要按照指定结构体切分，并选择对应的组播QP发送
+        int send_id = msg.meta.sender;
+        m_endpoints_mu_.lock();
+        auto my_node = Postoffice::Get()->van()->my_node();
+        LOG(INFO)<<my_node.id;
+        auto it = m_endpoints_.find(my_node.id);
+        if (it == m_endpoints_.end()) {
+            LOG(INFO) << "cann't not post wr to the receive queue, because can't find qp connection";
+            m_endpoints_mu_.unlock();
+        } else {
+            LOG(INFO) << "i find qp connection";
+            Endpoint *endpoint = m_endpoints_[my_node.id].get();
+            m_endpoints_mu_.unlock();
+            auto trans = CHECK_NOTNULL(endpoint->GetTransport());
+            auto ah = endpoint->GetMultAh();
+            auto remote_qpn = endpoint->GetMultRemoteQpn();
+            auto remote_qkey = endpoint->GetMultRemoteQkey();
+            LOG(INFO)<<"1111111111111111111111111111111111111111111111111111111111111111111111111111111";
+            trans->MultSendMsg(msg, msg_buf, remote_tuple, ah, remote_qpn, remote_qkey);
+            
+        }
+
+    }
+
     // PollCQ
     void PollCQ()
     {
@@ -899,32 +939,10 @@ private:
 
                         if (imm == kRendezvousStart) {
                             //表示是对端第一次发过来的消息，对端此时采用的是send，需要将本端的地址和rkey发送至对方，比如client首次push数据
-                            RendezvousStart *
-                                req =  // reinterpret允许将任何指针转换为其他指针类型。它允许将任何整数类型转换为任何指针以及反向转换。
-                                reinterpret_cast<RendezvousStart *>(mr->addr);
+                            RendezvousStart *req = reinterpret_cast<RendezvousStart *>(mr->addr);
+                            // reinterpret允许将任何指针转换为其他指针类型。它允许将任何整数类型转换为任何指针以及反向转换。
                             auto trans = CHECK_NOTNULL(endpoint->GetTransport());
-                            MultWRContext worker_receive;
-                            worker_receive.node_id = endpoint->node_id;
-                            bool pull_response;
-                            trans->SendRendezvousReply(req, addr_pool_, worker_receive, pull_response);
-                            //即server向worker发送pull response时，worker在向server回地址的同时，提交wr到组播的receive
-                            // queue
-                            if (pull_response) {
-                                // MulticastInitPostRecv();
-                                m_endpoints_mu_.lock();
-                                auto it = m_endpoints_.find(endpoint->node_id);  //找到对应的组播连接
-                                if (it == m_endpoints_.end()) {
-                                    LOG(INFO)
-                                        << "cann't not post wr to the receive queue, because can't find qp connection";
-                                    m_endpoints_mu_.unlock();
-                                } else {
-                                    LOG(INFO) << "i don't know it is correct";
-                                    Endpoint *endpoint = m_endpoints_[endpoint->node_id].get();
-                                    m_endpoints_mu_.unlock();
-                                    // WRContext wrc;
-                                    endpoint->MultPostRecvWR(worker_receive);
-                                }
-                            }
+                            trans->SendRendezvousReply(req, addr_pool_);
 
                         } else if (imm == kRendezvousReply) {  //表示收到对端发来的地址信息
                             RendezvousReply *resp = reinterpret_cast<RendezvousReply *>(mr->addr);
@@ -966,15 +984,14 @@ private:
                                 auto temp_mr = mem_mr_.find(msg_buf->data[1].data());
                                 CHECK_NE(temp_mr, mem_mr_.end());
                                 map_mu_.unlock();
-                                trans->SendPullResponse(*msg, msg_buf, addr_tuple, temp_mr->second->lkey);
+                                //trans->SendPullResponse(*msg, msg_buf, addr_tuple, temp_mr->second->lkey);
+                                //组播对应
+                                MultSendData(*msg, msg_buf, addr_tuple, temp_mr->second->lkey);
                             }
-
                             // release the msg_buf from msgbuf_cache_
                             ReleaseFirstMsg(msg_buf);
-
                         } else {
-                            
-                            LOG(INFO)<<" receive multicast message";
+                            LOG(INFO) << " receive multicast message";
                             CHECK(0);
                         }
                         ReleaseWorkRequestContext(context, endpoint);
@@ -1181,12 +1198,11 @@ private:
             // LOG(INFO) << "multicast OnAddrResolved \n"; //对应组播连接的情况
             Endpoint *endpoint = reinterpret_cast<Endpoint *>(id->context);  //对应组播的连接
 
-            
             if (m_cq_ == nullptr) {
                 MulticastInitContext(id->verbs);
             }
-            
-            //if (context_ == nullptr) {
+
+            // if (context_ == nullptr) {
             //    InitContext(id->verbs);
             //}
 
